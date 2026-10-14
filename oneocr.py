@@ -84,42 +84,49 @@ def suppress_output():
         os.close(original_stderr)
         os.close(devnull)
 
-OPENAI_URL = 'https://api.openai.com/v1/chat/completions'
-OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-4o-mini')
-MAX_SUMMARY_CHARS = 100_000
+OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://localhost:11434').rstrip('/')
+OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'qwen2.5:1.5b')
+OLLAMA_NUM_CTX = int(os.environ.get('OLLAMA_NUM_CTX', '16384'))
+# qwen2.5:1.5b is a small model: keep the input within the context window (~4 chars per token).
+MAX_SUMMARY_CHARS = int(os.environ.get('MAX_SUMMARY_CHARS', '30000'))
 SUMMARY_PROMPT = (
-    'Summarize the OCR-extracted document concisely in its original language. Correct obvious OCR errors using context without changing meaning. Start with 1–2 sentences describing the document, then list key points, figures, names, dates, and action items. Use plain text with "- " bullets only. Do not omit important details or invent information.'
+    'Summarize the OCR-extracted document concisely. Correct obvious OCR errors using context without changing meaning. Start with 1\u20132 sentences describing the document, then list key points. Use text formatting to enhance readability in html. Do not omit important details or invent information.'
 )
 
-def summarize_text(text, api_key):
-    '''Summarize OCR text with the OpenAI chat completions API. Raises RuntimeError on failure.'''
+def summarize_text(text):
+    '''Summarize OCR text with a local Ollama model. Raises RuntimeError on failure.'''
     payload = json.dumps({
-        'model': OPENAI_MODEL,
+        'model': OLLAMA_MODEL,
         'messages': [
             {'role': 'system', 'content': SUMMARY_PROMPT},
             {'role': 'user', 'content': text[:MAX_SUMMARY_CHARS]},
         ],
-        'temperature': 0.3,
+        'stream': False,
+        'options': {'temperature': 0.3, 'num_ctx': OLLAMA_NUM_CTX},
     }).encode('utf-8')
     req = urllib.request.Request(
-        OPENAI_URL, data=payload, method='POST',
-        headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'},
+        f'{OLLAMA_URL}/api/chat', data=payload, method='POST',
+        headers={'Content-Type': 'application/json'},
     )
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             data = json.load(resp)
     except urllib.error.HTTPError as e:
         try:
-            msg = json.load(e).get('error', {}).get('message')
+            msg = json.load(e).get('error')
         except Exception:
             msg = None
-        raise RuntimeError(msg or f'OpenAI returned HTTP {e.code}') from e
-    except (urllib.error.URLError, TimeoutError) as e:
-        raise RuntimeError(f'Could not reach OpenAI: {getattr(e, "reason", e)}') from e
+        if e.code == 404:
+            msg = msg or f'Model not found. Run: ollama pull {OLLAMA_MODEL}'
+        raise RuntimeError(msg or f'Ollama returned HTTP {e.code}') from e
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        raise RuntimeError(
+            f'Could not reach Ollama at {OLLAMA_URL}: {getattr(e, "reason", e)}. Is "ollama serve" running?'
+        ) from e
     try:
-        return data['choices'][0]['message']['content'].strip()
-    except (KeyError, IndexError, AttributeError) as e:
-        raise RuntimeError('Unexpected response from OpenAI') from e
+        return data['message']['content'].strip()
+    except (KeyError, TypeError, AttributeError) as e:
+        raise RuntimeError('Unexpected response from Ollama') from e
 
 def pdf_to_images(pdf_bytes, dpi=200):
     '''Render each PDF page to a PIL image'''
@@ -482,12 +489,7 @@ def serve():
 
     @app.post('/summarize')
     async def summarize(request: Request):
-        '''Summarize extracted text with ChatGPT. The API key stays on the server.'''
-        api_key = os.environ.get('OPENAI_API_KEY', '').strip()
-        if not api_key:
-            return JSONResponse(
-                {'error': 'OPENAI_API_KEY is not set on the server. Set it and restart oneocr_serve.'},
-                status_code=503)
+        '''Summarize extracted text with a local Ollama model.'''
         try:
             body = await request.json()
         except Exception:
@@ -496,10 +498,10 @@ def serve():
         if not text:
             return JSONResponse({'error': 'There is no text to summarize.'}, status_code=400)
         try:
-            summary = await run_in_threadpool(summarize_text, text, api_key)
+            summary = await run_in_threadpool(summarize_text, text)
         except RuntimeError as e:
             return JSONResponse({'error': str(e)}, status_code=502)
-        return {'summary': summary, 'model': OPENAI_MODEL}
+        return {'summary': summary, 'model': OLLAMA_MODEL}
 
     uvicorn.run(app, host='0.0.0.0', port=8001)
 
